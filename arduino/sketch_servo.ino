@@ -1,6 +1,9 @@
 #include <Servo.h>
 
-const int servoPin = 9;
+const int servoPin    = 9;
+const int ledPin      = 13;
+const int buttonPin   = 2;
+
 Servo myServo;
 
 // ==========================================
@@ -14,7 +17,7 @@ const int STEPS_PER_SCAN      = 36;    // 360 / 10
 const int DEG_PER_STEP        = 10;
 
 unsigned long timeFor10Deg = 213;      // Откалибруйте через команду 'C' в Python!
-int positionDeg             = 0;       // Текущая позиция антенны (градусы)
+int positionDeg             = 0;       // Текущая позиция антенны
 // ==========================================
 
 
@@ -24,10 +27,24 @@ void drainSerial() {
   }
 }
 
+void blinkLed(int count, int onMs, int offMs) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(onMs);
+    digitalWrite(ledPin, LOW);
+    if (i < count - 1) delay(offMs);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+  pinMode(ledPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
   myServo.attach(servoPin);
   myServo.write(SERVO_STOP);
+  digitalWrite(ledPin, LOW);
+
+  blinkLed(3, 100, 100);
   Serial.println("SYSTEM_READY");
 }
 
@@ -55,20 +72,32 @@ void loop() {
       drainSerial();
 
       if (cmd == 'S' || cmd == 's') {
-        runScan();
+        runScan('1');
+      } else if (cmd == '2') {
+        runScan('2');
       } else if (cmd == 'C' || cmd == 'c') {
         runCalibration();
       } else if (cmd == 'H' || cmd == 'h') {
         returnHome();
+      } else if (cmd == 'R' || cmd == 'r') {
+        Serial.println("RESET_OK");
       }
+    }
+  }
+
+  if (digitalRead(buttonPin) == LOW) {
+    delay(50);
+    if (digitalRead(buttonPin) == LOW) {
+      while (digitalRead(buttonPin) == LOW) {
+        delay(10);
+      }
+      Serial.println("BUTTON_PRESSED");
     }
   }
 }
 
 // ------------------------------------------
-// КАЛИБРОВКА: полный оборот CW
-// Перед запуском: поставьте антенну на отметку 0°
-// Python спросит где она оказалась и пересчитает timeFor10Deg
+// КАЛИБРОВКА
 // ------------------------------------------
 void runCalibration() {
   Serial.println("CAL_START");
@@ -77,8 +106,10 @@ void runCalibration() {
   myServo.attach(servoPin);
   myServo.write(SERVO_MOVE_CW);
 
+  digitalWrite(ledPin, HIGH);
   unsigned long totalMs = timeFor10Deg * STEPS_PER_SCAN;
   delay(totalMs);
+  digitalWrite(ledPin, LOW);
 
   myServo.write(SERVO_STOP);
   delay(SETTLE_DELAY_MS);
@@ -90,8 +121,7 @@ void runCalibration() {
 }
 
 // ------------------------------------------
-// ВОЗВРАТ ДОМОЙ: доворот от текущей позиции до 360°=0°
-// Учитывает, на каком шаге остановился скан (или после скана)
+// ВОЗВРАТ ДОМОЙ
 // ------------------------------------------
 void returnHome() {
   Serial.println("HOME_START");
@@ -114,8 +144,10 @@ void returnHome() {
 
   myServo.attach(servoPin);
   myServo.write(SERVO_MOVE_CW);
+  digitalWrite(ledPin, HIGH);
   delay(rotateMs);
   myServo.write(SERVO_STOP);
+  digitalWrite(ledPin, LOW);
   delay(SETTLE_DELAY_MS);
   myServo.detach();
 
@@ -127,10 +159,16 @@ void returnHome() {
 
 // ------------------------------------------
 // ОСНОВНОЙ СКАН: 36 точек с handshake
+// phase = '1' (без отражателя) или '2' (с отражателем)
 // ------------------------------------------
-void runScan() {
+void runScan(char phase) {
   positionDeg = 0;
-  Serial.println("SCAN_START");
+
+  if (phase == '1') {
+    Serial.println("SCAN1_START");
+  } else {
+    Serial.println("SCAN2_START");
+  }
 
   for (int i = 0; i < STEPS_PER_SCAN; i++) {
     positionDeg = i * DEG_PER_STEP;
@@ -139,7 +177,11 @@ void runScan() {
     delay(SETTLE_DELAY_MS);
     myServo.detach();
 
-    Serial.print("READY:");
+    digitalWrite(ledPin, HIGH);
+
+    Serial.print("READY");
+    Serial.print(phase);
+    Serial.print(":");
     Serial.println(positionDeg);
 
     unsigned long startWait = millis();
@@ -148,12 +190,15 @@ void runScan() {
         Serial.println("SCAN_TIMEOUT");
         myServo.attach(servoPin);
         myServo.write(SERVO_STOP);
+        digitalWrite(ledPin, LOW);
         return;
       }
       delay(10);
     }
     Serial.read();
     drainSerial();
+
+    digitalWrite(ledPin, LOW);
 
     if (i < STEPS_PER_SCAN - 1) {
       myServo.attach(servoPin);
@@ -163,7 +208,15 @@ void runScan() {
   }
 
   positionDeg = (STEPS_PER_SCAN - 1) * DEG_PER_STEP;
-  Serial.println("SCAN_FINISHED");
+
+  if (phase == '1') {
+    Serial.println("SCAN1_FINISHED");
+  } else {
+    Serial.println("SCAN2_FINISHED");
+  }
+
   myServo.attach(servoPin);
   myServo.write(SERVO_STOP);
+
+  blinkLed(5, 200, 200);
 }

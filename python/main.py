@@ -46,8 +46,9 @@ def compute_psd(samples, sample_rate):
     return freqs, psd
 
 
-def get_signal_power_at_freq(sdr):
-    powers = []
+def get_signal_power_and_snr(sdr):
+    powers_signal = []
+    powers_noise = []
     _ = read_samples_safe(sdr, NUM_SAMPLES)
 
     for _ in range(AVERAGE_COUNT):
@@ -56,17 +57,27 @@ def get_signal_power_at_freq(sdr):
             continue
 
         freqs, psd = compute_psd(samples, sdr.sample_rate)
-        mask = np.abs(freqs) <= NARROW_BAND_HZ / 2
+        mask_signal = np.abs(freqs) <= NARROW_BAND_HZ / 2
 
-        if np.any(mask):
-            power_linear = np.mean(psd[mask])
-            if power_linear > 0:
-                power_db = 10 * np.log10(power_linear)
-                powers.append(power_db)
+        if np.any(mask_signal):
+            power_signal = np.mean(psd[mask_signal])
+            if power_signal > 0:
+                powers_signal.append(10 * np.log10(power_signal))
 
-    if len(powers) == 0:
-        return POWER_FLOOR_DB
-    return np.median(powers)
+        far_mask = np.abs(freqs) > 500000
+        if np.any(far_mask):
+            power_noise = np.median(psd[far_mask])
+            if power_noise > 0:
+                powers_noise.append(10 * np.log10(power_noise))
+
+    if len(powers_signal) == 0:
+        return POWER_FLOOR_DB, POWER_FLOOR_DB - 10
+
+    sig = np.median(powers_signal)
+    noise = np.median(powers_noise) if len(powers_noise) > 0 else sig - 10
+    snr = sig - noise
+
+    return sig, snr
 
 
 def find_signal_frequency(sdr):
@@ -288,7 +299,125 @@ def run_calibration(ser):
     print("  Калибровка завершена.\n")
 
 
+def run_phase_scan(ser, sdr, phase, label):
+    angles = []
+    powers = []
+    snrs = []
+
+    ser.reset_input_buffer()
+    ser.write(b"S" if phase == 1 else b"2")
+    print(f"\nФАЗА {phase}: {label}")
+    print(f"Команда отправлена. Ожидание SCAN{phase}_START...\n")
+
+    scan_started = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line == f"SCAN{phase}_START":
+                scan_started = True
+                break
+        time.sleep(0.05)
+
+    if not scan_started:
+        print(f"ОШИБКА: Arduino не ответила SCAN{phase}_START!")
+        return angles, powers, snrs
+
+    print(f"Сканирование фазы {phase} начато.\n")
+
+    scan_t0 = time.time()
+    try:
+        while True:
+            if time.time() - scan_t0 > SCAN_OVERALL_TIMEOUT_S:
+                print("\nОШИБКА: общий таймаут сканирования!")
+                break
+
+            if ser.in_waiting > 0:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+
+                if line.startswith(f"READY{phase}:"):
+                    try:
+                        angle = int(line.split(":")[1].strip())
+                    except (ValueError, IndexError):
+                        print(f"  Ошибка парсинга угла: '{line}'")
+                        ser.write(b"K")
+                        continue
+
+                    print(f"[{angle:03d}°] Ожидание 2 секунды...", end="\r")
+                    time.sleep(2)
+
+                    print(f"[{angle:03d}°] Замер эфира...       ", end=" ")
+                    power, snr = get_signal_power_and_snr(sdr)
+
+                    angles.append(angle)
+                    powers.append(power)
+                    snrs.append(snr)
+
+                    print(f"Мощность: {power:.2f} dB  SNR: {snr:.1f} dB")
+                    ser.write(b"K")
+
+                elif line == f"SCAN{phase}_FINISHED":
+                    print(f"\nФаза {phase} завершена!")
+                    break
+
+                elif line == "SCAN_TIMEOUT":
+                    print("\nВНИМАНИЕ: Arduino сообщила о таймауте!")
+                    break
+
+                else:
+                    print(f"  [Arduino] {line}")
+
+            else:
+                time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        print("\nОстановлено пользователем.")
+
+    return angles, powers, snrs
+
+
+def find_peak(angles_deg, powers_db):
+    max_idx = int(np.argmax(powers_db))
+    return angles_deg[max_idx], powers_db[max_idx]
+
+
+def find_peak_with_snr(angles_deg, powers_db, snrs_db):
+    max_idx = int(np.argmax(powers_db))
+    return angles_deg[max_idx], powers_db[max_idx], snrs_db[max_idx]
+
+
+def print_methodology():
+    print("\n" + "=" * 65)
+    print("  МЕТОДИКА ПЕЛЕНГАЦИИ")
+    print("=" * 65)
+    print("""
+  Метод: амплитудная пеленгация с уголковым отражателем
+
+  Принцип:
+  1. Всенаправленная антенна + SDR приёмник измеряют мощность
+     сигнала на каждом угле поворота платформы (шаг 10°)
+  2. Фаза 1 (БЕЗ отражателя): строим диаграмму направленности
+     всенаправленной антенны — ожидаем примерно равномерный приём
+  3. Фаза 2 (С отражателем): уголковый отражатель создаёт
+     направленность — максимум сигнала возникает когда отражатель
+     направлен на источник (отражённый сигнал складывается
+     с прямым)
+  4. Сравнение фаз: пик в фазе 2 указывает направление на
+     передатчик. Разница мощностей до/после = усиление
+     отражателя в данном направлении
+  5. SNR (сигнал/шум) подтверждает достоверность пика
+
+  Оборудование:
+  - RTL-SDR V3: приёмник, PSD через FFT, полоса ±100 кГц
+  - Arduino Uno: сервопривод 360°, шаг 10°
+  - Уголковый отражатель: лист алюминия + металлизированный скотч
+  - LED: индикация замера, кнопка «Пуск/Сброс»
+""")
+
+
 def main():
+    print_methodology()
+
     print("Инициализация RTL-SDR...")
     try:
         sdr = RtlSdr()
@@ -326,14 +455,14 @@ def main():
     else:
         print("Внимание: SYSTEM_READY не получен (возможно уже загружена).")
 
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 65)
     print("  РАДАР ГОТОВ. ОЖИДАНИЕ КОМАНДЫ...")
-    print("=" * 55)
-    print("  ENTER    — найти частоту и начать сканирование")
+    print("=" * 65)
+    print("  ENTER    — полный цикл (поиск частоты + 2 фазы скана)")
     print("  C+ENTER  — калибровка (расчёт timeFor10Deg)")
     print("  H+ENTER  — возврат антенны на 0°")
     print("  F+ENTER  — повторный поиск частоты")
-    print("=" * 55)
+    print("=" * 65)
 
     found_freq = None
 
@@ -368,141 +497,219 @@ def main():
     sdr.center_freq = float(found_freq)
     print(f"\nЧастота для сканирования: {found_freq / 1e6:.3f} МГц")
 
-    angles = []
-    powers = []
+    # ==================================================
+    # ФАЗА 1: СКАН БЕЗ ОТРАЖАТЕЛЯ
+    # ==================================================
+    print("\n" + "#" * 65)
+    print("#  ФАЗА 1: СКАНИРОВАНИЕ БЕЗ УГОЛКОВОГО ОТРАЖАТЕЛЯ")
+    print("#" * 65)
+    print("  Убедитесь, что отражатель СНЯТ с антенны!")
+    input("  Нажмите ENTER для старта фазы 1... ")
 
-    ser.reset_input_buffer()
-    ser.write(b"S")
-    print("Команда сканирования отправлена. Ожидание SCAN_START...\n")
+    angles1, powers1, snrs1 = run_phase_scan(ser, sdr, phase=1, label="БЕЗ отражателя")
 
-    scan_started = False
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if ser.in_waiting > 0:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line == "SCAN_START":
-                scan_started = True
-                break
-        time.sleep(0.05)
-
-    if not scan_started:
-        print("ОШИБКА: Arduino не ответила SCAN_START!")
+    if len(angles1) == 0:
+        print("ОШИБКА: Нет данных фазы 1!")
         ser.close()
         sdr.close()
         sys.exit(1)
 
-    print("Сканирование начато.\n")
+    peak1_angle, peak1_power, peak1_snr = find_peak_with_snr(angles1, powers1, snrs1)
 
-    scan_t0 = time.time()
-    try:
-        while True:
-            if time.time() - scan_t0 > SCAN_OVERALL_TIMEOUT_S:
-                print("\nОШИБКА: общий таймаут сканирования!")
-                break
+    peak2_angle = peak1_angle
+    peak2_power = peak1_power
+    peak2_snr = peak1_snr
+    method = "Фаза 1 (без отражателя)"
 
-            if ser.in_waiting > 0:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
+    # Возврат домой
+    ser.reset_input_buffer()
+    ser.write(b"H")
+    wait_for_arduino_line(ser, "HOME_DONE", timeout_s=15)
 
-                if line.startswith("READY:"):
-                    try:
-                        angle = int(line.split(":")[1].strip())
-                    except (ValueError, IndexError):
-                        print(f"  Ошибка парсинга угла: '{line}'")
-                        ser.write(b"K")
-                        continue
-
-                    print(f"[{angle:03d}°] Ожидание 2 секунды...", end="\r")
-                    time.sleep(2)
-
-                    print(f"[{angle:03d}°] Замер эфира...       ", end=" ")
-                    power = get_signal_power_at_freq(sdr)
-
-                    angles.append(angle)
-                    powers.append(power)
-
-                    print(f"Мощность: {power:.2f} dB")
-                    ser.write(b"K")
-
-                elif line == "SCAN_FINISHED":
-                    print("\nСканирование успешно завершено!")
-                    break
-
-                elif line == "SCAN_TIMEOUT":
-                    print("\nВНИМАНИЕ: Arduino сообщила о таймауте! Данные частичны.")
-                    break
-
-                else:
-                    print(f"  [Arduino] {line}")
-
-            else:
-                time.sleep(0.01)
-
-    except KeyboardInterrupt:
-        print("\nОстановлено пользователем.")
-    finally:
-        ser.close()
-        sdr.close()
-
-    if len(angles) == 0:
-        print("Нет данных для построения графика.")
-        sys.exit(0)
-
-    peak_angle, peak_power = find_peak(angles, powers)
-    print(f"\n{'=' * 55}")
-    print(f"  ИСТОЧНИК НАЙДЕН:")
-    print(f"    Частота:     {found_freq / 1e6:.3f} МГц")
-    print(f"    Направление: {peak_angle}°")
-    print(f"    Мощность:    {peak_power:.2f} dB")
-    print(f"{'=' * 55}")
-
-    plot_polar_data(angles, powers, peak_angle, peak_power, found_freq)
-
-
-def find_peak(angles_deg, powers_db):
-    max_idx = int(np.argmax(powers_db))
-    return angles_deg[max_idx], powers_db[max_idx]
-
-
-def plot_polar_data(angles_deg, powers_db, peak_angle, peak_power, found_freq):
-    print("Отрисовка диаграммы направленности...")
-    angles_rad = np.deg2rad(angles_deg)
-    angles_rad_closed = np.append(angles_rad, angles_rad[0])
-    powers_db_closed = np.append(powers_db, powers_db[0])
-
-    plt.figure(figsize=(8, 8))
-    ax = plt.subplot(111, projection="polar")
-    ax.set_theta_zero_location("N")
-    ax.set_theta_direction(-1)
-
-    ax.plot(
-        angles_rad_closed,
-        powers_db_closed,
-        color="red",
-        linewidth=2,
-        linestyle="solid",
-        marker="o",
-        markersize=4,
-    )
-    ax.fill(angles_rad_closed, powers_db_closed, color="red", alpha=0.3)
-
-    ax.set_title(
-        f"Пеленгация: {found_freq / 1e6:.3f} МГц → {peak_angle}°",
-        va="bottom",
-        fontsize=14,
-        fontweight="bold",
+    print(f"\n  Результат фазы 1 (без отражателя):")
+    print(
+        f"    Максимум: {peak1_angle}°, мощность {peak1_power:.2f} dB, SNR {peak1_snr:.1f} dB"
     )
 
-    ax.annotate(
-        f"ЦЕЛЬ: {peak_angle}°",
-        xy=(np.deg2rad(peak_angle), peak_power),
-        xytext=(np.deg2rad(peak_angle), peak_power + 5),
-        arrowprops=dict(facecolor="black", shrink=0.05),
-        horizontalalignment="center",
-        fontsize=12,
-        fontweight="bold",
+    # ==================================================
+    # ФАЗА 2: СКАН С ОТРАЖАТЕЛЕМ
+    # ==================================================
+    print("\n" + "#" * 65)
+    print("#  ФАЗА 2: СКАНИРОВАНИЕ С УГОЛКОВЫМ ОТРАЖАТЕЛЕМ")
+    print("#" * 65)
+    print("  Установите уголковый отражатель на антенну!")
+    input("  Нажмите ENTER для старта фазы 2... ")
+
+    angles2, powers2, snrs2 = run_phase_scan(ser, sdr, phase=2, label="С отражателем")
+
+    if len(angles2) == 0:
+        print("ОШИБКА: Нет данных фазы 2! Используем только фазу 1.")
+        final_angle = peak1_angle
+        final_power = peak1_power
+    else:
+        peak2_angle, peak2_power, peak2_snr = find_peak_with_snr(
+            angles2, powers2, snrs2
+        )
+
+        print(f"\n  Результат фазы 2 (с отражателем):")
+        print(
+            f"    Максимум: {peak2_angle}°, мощность {peak2_power:.2f} dB, SNR {peak2_snr:.1f} dB"
+        )
+
+        if peak2_snr > peak1_snr:
+            method = "Фаза 2 (с отражателем) — более выраженный пик"
+        else:
+            method = "Фаза 2 (с отражателем) — подтверждено направлением"
+
+        final_angle = peak2_angle
+        final_power = peak2_power
+
+    # Возврат домой
+    ser.reset_input_buffer()
+    ser.write(b"H")
+    wait_for_arduino_line(ser, "HOME_DONE", timeout_s=15)
+
+    ser.close()
+    sdr.close()
+
+    # ==================================================
+    # ИТОГОВЫЙ ОТЧЁТ
+    # ==================================================
+    print("\n" + "=" * 65)
+    print("  ИТОГОВЫЙ ОТЧЁТ ПЕЛЕНГАЦИИ")
+    print("=" * 65)
+    print(f"  Частота источника:  {found_freq / 1e6:.3f} МГц")
+    print(f"  Усиление SDR:       {chosen_gain:.1f} dB")
+    print()
+    print(f"  Фаза 1 (без отражателя):")
+    print(
+        f"    Пик: {peak1_angle}°  Мощность: {peak1_power:.2f} dB  SNR: {peak1_snr:.1f} dB"
     )
+    if len(angles2) > 0:
+        print(f"  Фаза 2 (с отражателем):")
+        print(
+            f"    Пик: {peak2_angle}°  Мощность: {peak2_power:.2f} dB  SNR: {peak2_snr:.1f} dB"
+        )
+        print()
+        gain_diff = peak2_power - peak1_power
+        print(f"  Усиление от отражателя: {gain_diff:+.2f} dB в направлении пика")
+    print()
+    print(f"  >>> НАПРАВЛЕНИЕ НА ИСТОЧНИК: {final_angle}° <<<")
+    print(f"  Метод определения: {method}")
+    print("=" * 65)
+
+    plot_dual_polar(angles1, powers1, angles2, powers2, found_freq, final_angle)
+
+
+def plot_dual_polar(angles1, powers1, angles2, powers2, found_freq, final_angle):
+    print("Построение графиков...")
+
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        1, 3, figsize=(20, 7), subplot_kw={"projection": "polar"}
+    )
+
+    for ax in [ax1, ax2, ax3]:
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+
+    def plot_single(ax, angles_deg, powers_db, color, title):
+        angles_rad = np.deg2rad(angles_deg)
+        angles_rad_c = np.append(angles_rad, angles_rad[0])
+        powers_db_c = np.append(powers_db, powers_db[0])
+        ax.plot(
+            angles_rad_c,
+            powers_db_c,
+            color=color,
+            linewidth=2,
+            marker="o",
+            markersize=3,
+        )
+        ax.fill(angles_rad_c, powers_db_c, color=color, alpha=0.2)
+        peak_idx = int(np.argmax(powers_db))
+        peak_a = angles_deg[peak_idx]
+        peak_p = powers_db[peak_idx]
+        ax.annotate(
+            f"{peak_a}°",
+            xy=(np.deg2rad(peak_a), peak_p),
+            xytext=(np.deg2rad(peak_a), peak_p + 5),
+            arrowprops=dict(facecolor="black", shrink=0.05),
+            horizontalalignment="center",
+            fontsize=11,
+            fontweight="bold",
+        )
+        ax.set_title(title, va="bottom", fontsize=11, fontweight="bold")
+
+    plot_single(
+        ax1,
+        angles1,
+        powers1,
+        "blue",
+        f"Фаза 1: без отражателя\n{found_freq / 1e6:.3f} МГц",
+    )
+
+    if len(angles2) > 0:
+        plot_single(
+            ax2,
+            angles2,
+            powers2,
+            "red",
+            f"Фаза 2: с отражателем\n{found_freq / 1e6:.3f} МГц",
+        )
+
+        angles_rad1 = np.deg2rad(angles1)
+        powers1_c = np.append(powers1, powers1[0])
+        angles_rad1_c = np.append(angles_rad1, angles_rad1[0])
+        angles_rad2 = np.deg2rad(angles2)
+        powers2_c = np.append(powers2, powers2[0])
+        angles_rad2_c = np.append(angles_rad2, angles_rad2[0])
+
+        ax3.plot(
+            angles_rad1_c,
+            powers1_c,
+            "b-",
+            linewidth=2,
+            label="Без отражателя",
+            marker="o",
+            markersize=2,
+        )
+        ax3.plot(
+            angles_rad2_c,
+            powers2_c,
+            "r-",
+            linewidth=2,
+            label="С отражателем",
+            marker="o",
+            markersize=2,
+        )
+
+        peak_idx2 = int(np.argmax(powers2))
+        peak_a2 = angles2[peak_idx2]
+        peak_p2 = powers2[peak_idx2]
+        ax3.annotate(
+            f"ЦЕЛЬ: {final_angle}°",
+            xy=(np.deg2rad(peak_a2), peak_p2),
+            xytext=(np.deg2rad(peak_a2), peak_p2 + 8),
+            arrowprops=dict(facecolor="red", shrink=0.05, width=2),
+            horizontalalignment="center",
+            fontsize=13,
+            fontweight="bold",
+            color="red",
+        )
+
+        ax3.legend(loc="lower right", fontsize=9)
+        ax3.set_title(
+            f"Сравнение: направление {final_angle}°\n{found_freq / 1e6:.3f} МГц",
+            va="bottom",
+            fontsize=11,
+            fontweight="bold",
+        )
+    else:
+        ax2.set_title("Фаза 2: нет данных", va="bottom")
+        ax3.set_title("Сравнение: нет данных", va="bottom")
 
     plt.tight_layout()
+    plt.savefig("pelenq_result.png", dpi=150, bbox_inches="tight")
+    print("  График сохранён: pelenq_result.png")
     plt.show()
 
 
