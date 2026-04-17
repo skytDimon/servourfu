@@ -72,15 +72,11 @@ void loop() {
       drainSerial();
 
       if (cmd == 'S' || cmd == 's') {
-        runScan('1');
-      } else if (cmd == '2') {
-        runScan('2');
+        runScan();
       } else if (cmd == 'C' || cmd == 'c') {
         runCalibration();
       } else if (cmd == 'H' || cmd == 'h') {
         returnHome();
-      } else if (cmd == 'R' || cmd == 'r') {
-        Serial.println("RESET_OK");
       }
     }
   }
@@ -105,13 +101,13 @@ void runCalibration() {
 
   myServo.attach(servoPin);
   myServo.write(SERVO_MOVE_CW);
-
   digitalWrite(ledPin, HIGH);
+
   unsigned long totalMs = timeFor10Deg * STEPS_PER_SCAN;
   delay(totalMs);
-  digitalWrite(ledPin, LOW);
 
   myServo.write(SERVO_STOP);
+  digitalWrite(ledPin, LOW);
   delay(SETTLE_DELAY_MS);
   myServo.detach();
 
@@ -158,17 +154,11 @@ void returnHome() {
 }
 
 // ------------------------------------------
-// ОСНОВНОЙ СКАН: 36 точек с handshake
-// phase = '1' (без отражателя) или '2' (с отражателем)
+// СКАН: 36 точек с handshake
 // ------------------------------------------
-void runScan(char phase) {
+void runScan() {
   positionDeg = 0;
-
-  if (phase == '1') {
-    Serial.println("SCAN1_START");
-  } else {
-    Serial.println("SCAN2_START");
-  }
+  Serial.println("SCAN_START");
 
   for (int i = 0; i < STEPS_PER_SCAN; i++) {
     positionDeg = i * DEG_PER_STEP;
@@ -179,9 +169,7 @@ void runScan(char phase) {
 
     digitalWrite(ledPin, HIGH);
 
-    Serial.print("READY");
-    Serial.print(phase);
-    Serial.print(":");
+    Serial.print("READY:");
     Serial.println(positionDeg);
 
     unsigned long startWait = millis();
@@ -208,12 +196,7 @@ void runScan(char phase) {
   }
 
   positionDeg = (STEPS_PER_SCAN - 1) * DEG_PER_STEP;
-
-  if (phase == '1') {
-    Serial.println("SCAN1_FINISHED");
-  } else {
-    Serial.println("SCAN2_FINISHED");
-  }
+  Serial.println("SCAN_FINISHED");
 
   myServo.attach(servoPin);
   myServo.write(SERVO_STOP);

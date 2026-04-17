@@ -299,31 +299,31 @@ def run_calibration(ser):
     print("  Калибровка завершена.\n")
 
 
-def run_phase_scan(ser, sdr, phase, label):
+def run_scan(ser, sdr, label):
     angles = []
     powers = []
     snrs = []
 
     ser.reset_input_buffer()
-    ser.write(b"S" if phase == 1 else b"2")
-    print(f"\nФАЗА {phase}: {label}")
-    print(f"Команда отправлена. Ожидание SCAN{phase}_START...\n")
+    ser.write(b"S")
+    print(f"\n{label}")
+    print("Команда отправлена. Ожидание SCAN_START...\n")
 
     scan_started = False
     deadline = time.time() + 10
     while time.time() < deadline:
         if ser.in_waiting > 0:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line == f"SCAN{phase}_START":
+            if line == "SCAN_START":
                 scan_started = True
                 break
         time.sleep(0.05)
 
     if not scan_started:
-        print(f"ОШИБКА: Arduino не ответила SCAN{phase}_START!")
+        print("ОШИБКА: Arduino не ответила SCAN_START!")
         return angles, powers, snrs
 
-    print(f"Сканирование фазы {phase} начато.\n")
+    print("Сканирование начато.\n")
 
     scan_t0 = time.time()
     try:
@@ -335,7 +335,7 @@ def run_phase_scan(ser, sdr, phase, label):
             if ser.in_waiting > 0:
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
 
-                if line.startswith(f"READY{phase}:"):
+                if line.startswith("READY:"):
                     try:
                         angle = int(line.split(":")[1].strip())
                     except (ValueError, IndexError):
@@ -356,8 +356,8 @@ def run_phase_scan(ser, sdr, phase, label):
                     print(f"Мощность: {power:.2f} dB  SNR: {snr:.1f} dB")
                     ser.write(b"K")
 
-                elif line == f"SCAN{phase}_FINISHED":
-                    print(f"\nФаза {phase} завершена!")
+                elif line == "SCAN_FINISHED":
+                    print("\nСканирование завершено!")
                     break
 
                 elif line == "SCAN_TIMEOUT":
@@ -376,9 +376,9 @@ def run_phase_scan(ser, sdr, phase, label):
     return angles, powers, snrs
 
 
-def find_peak(angles_deg, powers_db):
-    max_idx = int(np.argmax(powers_db))
-    return angles_deg[max_idx], powers_db[max_idx]
+def find_dip(angles_deg, powers_db, snrs_db):
+    min_idx = int(np.argmin(powers_db))
+    return angles_deg[min_idx], powers_db[min_idx], snrs_db[min_idx]
 
 
 def find_peak_with_snr(angles_deg, powers_db, snrs_db):
@@ -391,27 +391,37 @@ def print_methodology():
     print("  МЕТОДИКА ПЕЛЕНГАЦИИ")
     print("=" * 65)
     print("""
-  Метод: амплитудная пеленгация с уголковым отражателем
+  Метод: амплитудная пеленгация по минимуму (деструктивная
+  интерференция) с уголковым отражателем
 
-  Принцип:
-  1. Всенаправленная антенна + SDR приёмник измеряют мощность
-     сигнала на каждом угле поворота платформы (шаг 10°)
-  2. Фаза 1 (БЕЗ отражателя): строим диаграмму направленности
-     всенаправленной антенны — ожидаем примерно равномерный приём
-  3. Фаза 2 (С отражателем): уголковый отражатель создаёт
-     направленность — максимум сигнала возникает когда отражатель
-     направлен на источник (отражённый сигнал складывается
-     с прямым)
-  4. Сравнение фаз: пик в фазе 2 указывает направление на
-     передатчик. Разница мощностей до/после = усиление
-     отражателя в данном направлении
-  5. SNR (сигнал/шум) подтверждает достоверность пика
+  Физика:
+  - При отражении от проводящей стенки фаза волны сдвигается
+    на 180 градусов
+  - Антенна на расстоянии ~5 см от стенок отражателя
+  - Длина волны на 100 МГц: лямбда = 300 см
+  - Разность хода прямой и отражённой волны: ~10 см
+  - Итоговый фазовый сдвиг: 180 + ~12 = ~192 градуса
+    => почти противофаза => деструктивная интерференция
+
+  Принцип определения направления:
+  1. Скан БЕЗ отражателя: штыревая антенна всенаправленная,
+     уровень сигнала примерно равномерен по углам
+  2. Скан С отражателем: когда открытая сторона отражателя
+     направлена на передатчик, прямой и отражённый сигналы
+     складываются в противофазе => МИНИМУМ мощности (провал)
+  3. Направление на источник = угол МИНИМУМА мощности
+     в скане с отражателем
+
+  Почему минимум, а не максимум:
+  - Деструктивная интерференция даёт узкий глубокий провал
+  - Затенение (закрытая сторона) — широкое и размытое
+  - Провал чётче, чем максимум => выше точность пеленгации
 
   Оборудование:
-  - RTL-SDR V3: приёмник, PSD через FFT, полоса ±100 кГц
-  - Arduino Uno: сервопривод 360°, шаг 10°
-  - Уголковый отражатель: лист алюминия + металлизированный скотч
-  - LED: индикация замера, кнопка «Пуск/Сброс»
+  - RTL-SDR V3: приёмник, PSD через FFT, полоса +/-100 кГц
+  - Arduino Uno: сервопривод 360 град, шаг 10 град
+  - Уголковый отражатель: алюминий + металлизированный скотч
+  - LED: индикация замера, кнопка Пуск/Сброс
 """)
 
 
@@ -458,7 +468,7 @@ def main():
     print("\n" + "=" * 65)
     print("  РАДАР ГОТОВ. ОЖИДАНИЕ КОМАНДЫ...")
     print("=" * 65)
-    print("  ENTER    — полный цикл (поиск частоты + 2 фазы скана)")
+    print("  ENTER    — найти частоту и начать сканирование")
     print("  C+ENTER  — калибровка (расчёт timeFor10Deg)")
     print("  H+ENTER  — возврат антенны на 0°")
     print("  F+ENTER  — повторный поиск частоты")
@@ -498,71 +508,14 @@ def main():
     print(f"\nЧастота для сканирования: {found_freq / 1e6:.3f} МГц")
 
     # ==================================================
-    # ФАЗА 1: СКАН БЕЗ ОТРАЖАТЕЛЯ
+    # СКАН
     # ==================================================
-    print("\n" + "#" * 65)
-    print("#  ФАЗА 1: СКАНИРОВАНИЕ БЕЗ УГОЛКОВОГО ОТРАЖАТЕЛЯ")
-    print("#" * 65)
-    print("  Убедитесь, что отражатель СНЯТ с антенны!")
-    input("  Нажмите ENTER для старта фазы 1... ")
-
-    angles1, powers1, snrs1 = run_phase_scan(ser, sdr, phase=1, label="БЕЗ отражателя")
-
-    if len(angles1) == 0:
-        print("ОШИБКА: Нет данных фазы 1!")
-        ser.close()
-        sdr.close()
-        sys.exit(1)
-
-    peak1_angle, peak1_power, peak1_snr = find_peak_with_snr(angles1, powers1, snrs1)
-
-    peak2_angle = peak1_angle
-    peak2_power = peak1_power
-    peak2_snr = peak1_snr
-    method = "Фаза 1 (без отражателя)"
-
-    # Возврат домой
-    ser.reset_input_buffer()
-    ser.write(b"H")
-    wait_for_arduino_line(ser, "HOME_DONE", timeout_s=15)
-
-    print(f"\n  Результат фазы 1 (без отражателя):")
-    print(
-        f"    Максимум: {peak1_angle}°, мощность {peak1_power:.2f} dB, SNR {peak1_snr:.1f} dB"
+    has_reflector = input("\nУстановлен отражатель? (y/N): ").strip().lower() == "y"
+    label = (
+        "СКАНИРОВАНИЕ С ОТРАЖАТЕЛЕМ" if has_reflector else "СКАНИРОВАНИЕ БЕЗ ОТРАЖАТЕЛЯ"
     )
 
-    # ==================================================
-    # ФАЗА 2: СКАН С ОТРАЖАТЕЛЕМ
-    # ==================================================
-    print("\n" + "#" * 65)
-    print("#  ФАЗА 2: СКАНИРОВАНИЕ С УГОЛКОВЫМ ОТРАЖАТЕЛЕМ")
-    print("#" * 65)
-    print("  Установите уголковый отражатель на антенну!")
-    input("  Нажмите ENTER для старта фазы 2... ")
-
-    angles2, powers2, snrs2 = run_phase_scan(ser, sdr, phase=2, label="С отражателем")
-
-    if len(angles2) == 0:
-        print("ОШИБКА: Нет данных фазы 2! Используем только фазу 1.")
-        final_angle = peak1_angle
-        final_power = peak1_power
-    else:
-        peak2_angle, peak2_power, peak2_snr = find_peak_with_snr(
-            angles2, powers2, snrs2
-        )
-
-        print(f"\n  Результат фазы 2 (с отражателем):")
-        print(
-            f"    Максимум: {peak2_angle}°, мощность {peak2_power:.2f} dB, SNR {peak2_snr:.1f} dB"
-        )
-
-        if peak2_snr > peak1_snr:
-            method = "Фаза 2 (с отражателем) — более выраженный пик"
-        else:
-            method = "Фаза 2 (с отражателем) — подтверждено направлением"
-
-        final_angle = peak2_angle
-        final_power = peak2_power
+    angles, powers, snrs = run_scan(ser, sdr, label)
 
     # Возврат домой
     ser.reset_input_buffer()
@@ -572,144 +525,119 @@ def main():
     ser.close()
     sdr.close()
 
+    if len(angles) == 0:
+        print("ОШИБКА: Нет данных!")
+        sys.exit(1)
+
     # ==================================================
-    # ИТОГОВЫЙ ОТЧЁТ
+    # АНАЛИЗ
     # ==================================================
+    max_angle, max_power, max_snr = find_peak_with_snr(angles, powers, snrs)
+    min_angle, min_power, min_snr = find_dip(angles, powers, snrs)
+
     print("\n" + "=" * 65)
-    print("  ИТОГОВЫЙ ОТЧЁТ ПЕЛЕНГАЦИИ")
+    print("  РЕЗУЛЬТАТЫ СКАНИРОВАНИЯ")
     print("=" * 65)
-    print(f"  Частота источника:  {found_freq / 1e6:.3f} МГц")
-    print(f"  Усиление SDR:       {chosen_gain:.1f} dB")
+    print(f"  Частота:  {found_freq / 1e6:.3f} МГц")
+    print(f"  Усиление: {chosen_gain:.1f} dB")
+    print(f"  Отражатель: {'ДА' if has_reflector else 'НЕТ'}")
     print()
-    print(f"  Фаза 1 (без отражателя):")
-    print(
-        f"    Пик: {peak1_angle}°  Мощность: {peak1_power:.2f} dB  SNR: {peak1_snr:.1f} dB"
-    )
-    if len(angles2) > 0:
-        print(f"  Фаза 2 (с отражателем):")
-        print(
-            f"    Пик: {peak2_angle}°  Мощность: {peak2_power:.2f} dB  SNR: {peak2_snr:.1f} dB"
-        )
+
+    if has_reflector:
+        depth = max_power - min_power
+        print(f"  Максимум: {max_angle}°  {max_power:.2f} dB  SNR {max_snr:.1f} dB")
+        print(f"  МИНИМУМ:  {min_angle}°  {min_power:.2f} dB  SNR {min_snr:.1f} dB")
+        print(f"  Глубина провала: {depth:.2f} dB")
         print()
-        gain_diff = peak2_power - peak1_power
-        print(f"  Усиление от отражателя: {gain_diff:+.2f} dB в направлении пика")
-    print()
-    print(f"  >>> НАПРАВЛЕНИЕ НА ИСТОЧНИК: {final_angle}° <<<")
-    print(f"  Метод определения: {method}")
+        print(f"  >>> НАПРАВЛЕНИЕ НА ИСТОЧНИК: {min_angle}° <<<")
+        print(f"  (провал = деструктивная интерференция: отражатель")
+        print(f"   открытой стороной к передатчику)")
+        final_angle = min_angle
+    else:
+        print(f"  Максимум: {max_angle}°  {max_power:.2f} dB  SNR {max_snr:.1f} dB")
+        print(f"  Минимум:  {min_angle}°  {min_power:.2f} dB  SNR {min_snr:.1f} dB")
+        print()
+        print(f"  Без отражателя диаграмма примерно равномерна.")
+        print(f"  Для определения направления запустите скан ещё раз")
+        print(f"  с отражателем — направление = МИНИМУМ мощности.")
+        final_angle = max_angle
+
     print("=" * 65)
 
-    plot_dual_polar(angles1, powers1, angles2, powers2, found_freq, final_angle)
+    plot_polar(angles, powers, found_freq, final_angle, has_reflector)
 
 
-def plot_dual_polar(angles1, powers1, angles2, powers2, found_freq, final_angle):
-    print("Построение графиков...")
+def plot_polar(angles_deg, powers_db, found_freq, final_angle, has_reflector):
+    print("Построение графика...")
 
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        1, 3, figsize=(20, 7), subplot_kw={"projection": "polar"}
+    angles_rad = np.deg2rad(angles_deg)
+    angles_rad_c = np.append(angles_rad, angles_rad[0])
+    powers_db_c = np.append(powers_db, powers_db[0])
+
+    plt.figure(figsize=(8, 8))
+    ax = plt.subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+
+    color = "red" if has_reflector else "blue"
+    label_str = "С отражателем" if has_reflector else "Без отражателя"
+
+    ax.plot(
+        angles_rad_c, powers_db_c, color=color, linewidth=2, marker="o", markersize=3
+    )
+    ax.fill(angles_rad_c, powers_db_c, color=color, alpha=0.2)
+
+    max_idx = int(np.argmax(powers_db))
+    max_a = angles_deg[max_idx]
+    max_p = powers_db[max_idx]
+    ax.annotate(
+        f"max {max_a}°",
+        xy=(np.deg2rad(max_a), max_p),
+        xytext=(np.deg2rad(max_a), max_p + 5),
+        arrowprops=dict(facecolor="green", shrink=0.05),
+        horizontalalignment="center",
+        fontsize=10,
+        color="green",
     )
 
-    for ax in [ax1, ax2, ax3]:
-        ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)
-
-    def plot_single(ax, angles_deg, powers_db, color, title):
-        angles_rad = np.deg2rad(angles_deg)
-        angles_rad_c = np.append(angles_rad, angles_rad[0])
-        powers_db_c = np.append(powers_db, powers_db[0])
-        ax.plot(
-            angles_rad_c,
-            powers_db_c,
-            color=color,
-            linewidth=2,
-            marker="o",
-            markersize=3,
-        )
-        ax.fill(angles_rad_c, powers_db_c, color=color, alpha=0.2)
-        peak_idx = int(np.argmax(powers_db))
-        peak_a = angles_deg[peak_idx]
-        peak_p = powers_db[peak_idx]
-        ax.annotate(
-            f"{peak_a}°",
-            xy=(np.deg2rad(peak_a), peak_p),
-            xytext=(np.deg2rad(peak_a), peak_p + 5),
-            arrowprops=dict(facecolor="black", shrink=0.05),
-            horizontalalignment="center",
-            fontsize=11,
-            fontweight="bold",
-        )
-        ax.set_title(title, va="bottom", fontsize=11, fontweight="bold")
-
-    plot_single(
-        ax1,
-        angles1,
-        powers1,
-        "blue",
-        f"Фаза 1: без отражателя\n{found_freq / 1e6:.3f} МГц",
+    min_idx = int(np.argmin(powers_db))
+    min_a = angles_deg[min_idx]
+    min_p = powers_db[min_idx]
+    ax.annotate(
+        f"ЦЕЛЬ: {min_a}°" if has_reflector else f"min {min_a}°",
+        xy=(np.deg2rad(min_a), min_p),
+        xytext=(np.deg2rad(min_a), min_p - 5),
+        arrowprops=dict(
+            facecolor="red" if has_reflector else "gray",
+            shrink=0.05,
+            width=2 if has_reflector else 1,
+        ),
+        horizontalalignment="center",
+        fontsize=13 if has_reflector else 10,
+        fontweight="bold" if has_reflector else "normal",
+        color="red" if has_reflector else "gray",
     )
 
-    if len(angles2) > 0:
-        plot_single(
-            ax2,
-            angles2,
-            powers2,
-            "red",
-            f"Фаза 2: с отражателем\n{found_freq / 1e6:.3f} МГц",
-        )
-
-        angles_rad1 = np.deg2rad(angles1)
-        powers1_c = np.append(powers1, powers1[0])
-        angles_rad1_c = np.append(angles_rad1, angles_rad1[0])
-        angles_rad2 = np.deg2rad(angles2)
-        powers2_c = np.append(powers2, powers2[0])
-        angles_rad2_c = np.append(angles_rad2, angles_rad2[0])
-
-        ax3.plot(
-            angles_rad1_c,
-            powers1_c,
-            "b-",
-            linewidth=2,
-            label="Без отражателя",
-            marker="o",
-            markersize=2,
-        )
-        ax3.plot(
-            angles_rad2_c,
-            powers2_c,
-            "r-",
-            linewidth=2,
-            label="С отражателем",
-            marker="o",
-            markersize=2,
-        )
-
-        peak_idx2 = int(np.argmax(powers2))
-        peak_a2 = angles2[peak_idx2]
-        peak_p2 = powers2[peak_idx2]
-        ax3.annotate(
-            f"ЦЕЛЬ: {final_angle}°",
-            xy=(np.deg2rad(peak_a2), peak_p2),
-            xytext=(np.deg2rad(peak_a2), peak_p2 + 8),
-            arrowprops=dict(facecolor="red", shrink=0.05, width=2),
-            horizontalalignment="center",
-            fontsize=13,
-            fontweight="bold",
-            color="red",
-        )
-
-        ax3.legend(loc="lower right", fontsize=9)
-        ax3.set_title(
-            f"Сравнение: направление {final_angle}°\n{found_freq / 1e6:.3f} МГц",
+    freq_str = f"{found_freq / 1e6:.3f} МГц"
+    if has_reflector:
+        ax.set_title(
+            f"{label_str}\n{freq_str} → минимум = {final_angle}°",
             va="bottom",
-            fontsize=11,
+            fontsize=12,
             fontweight="bold",
         )
     else:
-        ax2.set_title("Фаза 2: нет данных", va="bottom")
-        ax3.set_title("Сравнение: нет данных", va="bottom")
+        ax.set_title(
+            f"{label_str}\n{freq_str}",
+            va="bottom",
+            fontsize=12,
+            fontweight="bold",
+        )
 
     plt.tight_layout()
-    plt.savefig("pelenq_result.png", dpi=150, bbox_inches="tight")
-    print("  График сохранён: pelenq_result.png")
+    fname = f"pelenq_{'with' if has_reflector else 'without'}_reflector.png"
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"  График сохранён: {fname}")
     plt.show()
 
 
