@@ -215,6 +215,79 @@ def find_safe_gain(sdr, start_gain=30.0):
     return 0.0
 
 
+def wait_for_arduino_line(ser, prefix, timeout_s=60):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line.startswith(prefix):
+                return line
+            print(f"  [Arduino] {line}")
+        time.sleep(0.05)
+    return None
+
+
+def run_calibration(ser):
+    print("\n" + "=" * 55)
+    print("  КАЛИБРОВКА ВРАЩЕНИЯ")
+    print("=" * 55)
+    print("  1. Поставьте антенну на отметку 0° (по лимбу)")
+    print("  2. Нажмите ENTER — антенна сделает оборот")
+    print("  3. Скажите где она остановилась")
+    print("=" * 55)
+
+    while True:
+        input("  Антенна на 0°? Нажмите ENTER... ")
+
+        ser.reset_input_buffer()
+        ser.write(b"C")
+
+        result = wait_for_arduino_line(ser, "CAL_DONE:", timeout_s=30)
+        if result is None:
+            print("  ОШИБКА: Arduino не ответила!")
+            return
+
+        total_ms = int(result.split(":")[1])
+        print(f"  Ардуино: оборот занял {total_ms} мс")
+
+        print("\n  Где сейчас антенна? (введите градусы от 0):")
+        print("    Если перешла через 0 — введите >360 (например 380)")
+        print("    Если не дошла — введите <360 (например 340)")
+
+        while True:
+            try:
+                actual_deg = float(input("    Фактический угол: "))
+                break
+            except ValueError:
+                print("    Введите число!")
+
+        new_time = int(round(10.0 * total_ms / actual_deg))
+        print(
+            f"\n  Расчёт: {total_ms} мс / {actual_deg}° = {total_ms / actual_deg:.2f} мс/град"
+        )
+        print(f"  Новое timeFor10Deg = {new_time} мс")
+
+        confirm = input(f"  Применить {new_time} мс? (Y/n): ").strip().upper()
+        if confirm != "N":
+            ser.reset_input_buffer()
+            cmd = f"T{new_time}\n".encode("utf-8")
+            ser.write(cmd)
+
+            confirm_result = wait_for_arduino_line(ser, "TIME_SET:", timeout_s=5)
+            if confirm_result and confirm_result.startswith("TIME_SET:"):
+                confirmed_val = confirm_result.split(":")[1]
+                print(f"  Ардуино подтвердила: timeFor10Deg = {confirmed_val} мс")
+            else:
+                print("  ОШИБКА: Arduino не подтвердила!")
+                return
+
+        retry = input("\n  Повторить калибровку? (y/N): ").strip().lower()
+        if retry != "y":
+            break
+
+    print("  Калибровка завершена.\n")
+
+
 def main():
     print("Инициализация RTL-SDR...")
     try:
@@ -257,7 +330,7 @@ def main():
     print("  РАДАР ГОТОВ. ОЖИДАНИЕ КОМАНДЫ...")
     print("=" * 55)
     print("  ENTER    — найти частоту и начать сканирование")
-    print("  C+ENTER  — калибровка (поворот 360°)")
+    print("  C+ENTER  — калибровка (расчёт timeFor10Deg)")
     print("  H+ENTER  — возврат антенны на 0°")
     print("  F+ENTER  — повторный поиск частоты")
     print("=" * 55)
@@ -268,14 +341,16 @@ def main():
         user_input = input("\n>>> Команда: ").strip().upper()
 
         if user_input == "C":
-            ser.reset_input_buffer()
-            ser.write(b"C")
-            print("Калибровка: антенна делает полный оборот...")
+            run_calibration(ser)
             continue
         elif user_input == "H":
             ser.reset_input_buffer()
             ser.write(b"H")
-            print("Возврат антенны на 0°...")
+            result = wait_for_arduino_line(ser, "HOME_DONE", timeout_s=15)
+            if result:
+                print(f"  Ардуино: {result}")
+            else:
+                print("  Таймаут при возврате домой.")
             continue
         elif user_input == "F":
             found_freq = find_signal_frequency(sdr)
@@ -308,8 +383,6 @@ def main():
             if line == "SCAN_START":
                 scan_started = True
                 break
-            elif line.startswith("CAL_DONE") or line.startswith("HOME_DONE"):
-                print(f"  Arduino: {line}")
         time.sleep(0.05)
 
     if not scan_started:
@@ -358,10 +431,8 @@ def main():
                     print("\nВНИМАНИЕ: Arduino сообщила о таймауте! Данные частичны.")
                     break
 
-                elif line == "CAL_START" or line.startswith("CAL_DONE"):
-                    pass
                 else:
-                    print(f"  [неизвестный ответ] {line}")
+                    print(f"  [Arduino] {line}")
 
             else:
                 time.sleep(0.01)
@@ -379,7 +450,7 @@ def main():
     peak_angle, peak_power = find_peak(angles, powers)
     print(f"\n{'=' * 55}")
     print(f"  ИСТОЧНИК НАЙДЕН:")
-    print(f"    Частота:  {found_freq / 1e6:.3f} МГц")
+    print(f"    Частота:     {found_freq / 1e6:.3f} МГц")
     print(f"    Направление: {peak_angle}°")
     print(f"    Мощность:    {peak_power:.2f} dB")
     print(f"{'=' * 55}")

@@ -6,14 +6,15 @@ Servo myServo;
 // ==========================================
 // НАСТРОЙКИ ВРАЩЕНИЯ
 // ==========================================
-const int SERVO_STOP       = 90;
-const int SERVO_MOVE_CW    = 83;   // < 90 = по часовой. Если крутит против — поставьте 97
-const int HANDSHAKE_TIMEOUT_MS = 30000;  // 30 сек ожидание ответа от Python
-const int SETTLE_DELAY_MS  = 300;  // Пауза после остановки для успокоения антенны
-const int STEPS_PER_SCAN   = 36;   // 360 / 10
-const int DEG_PER_STEP     = 10;
+const int SERVO_STOP          = 90;
+const int SERVO_MOVE_CW       = 83;    // < 90 = по часовой. Если крутит против — поставьте 97
+const int HANDSHAKE_TIMEOUT_MS = 30000;
+const int SETTLE_DELAY_MS     = 300;
+const int STEPS_PER_SCAN      = 36;    // 360 / 10
+const int DEG_PER_STEP        = 10;
 
-unsigned long timeFor10Deg = 213;  // ВАЖНО: откалибруйте командой 'C'!
+unsigned long timeFor10Deg = 213;      // Откалибруйте через команду 'C' в Python!
+int positionDeg             = 0;       // Текущая позиция антенны (градусы)
 // ==========================================
 
 
@@ -33,26 +34,45 @@ void setup() {
 void loop() {
   if (Serial.available() > 0) {
     char cmd = Serial.read();
-    delay(5);
-    drainSerial();
 
-    if (cmd == 'S' || cmd == 's') {
-      runScan();
-    } else if (cmd == 'C' || cmd == 'c') {
-      runCalibration();
-    } else if (cmd == 'H' || cmd == 'h') {
-      returnHome();
+    if (cmd == 'T' || cmd == 't') {
+      String numStr = "";
+      unsigned long startRead = millis();
+      while (millis() - startRead < 2000) {
+        if (Serial.available() > 0) {
+          char c = Serial.read();
+          if (c == '\n' || c == '\r') break;
+          if (c >= '0' && c <= '9') numStr += c;
+        }
+      }
+      if (numStr.length() > 0) {
+        timeFor10Deg = numStr.toInt();
+        Serial.print("TIME_SET:");
+        Serial.println(timeFor10Deg);
+      }
+    } else {
+      delay(5);
+      drainSerial();
+
+      if (cmd == 'S' || cmd == 's') {
+        runScan();
+      } else if (cmd == 'C' || cmd == 'c') {
+        runCalibration();
+      } else if (cmd == 'H' || cmd == 'h') {
+        returnHome();
+      }
     }
   }
 }
 
 // ------------------------------------------
-// КАЛИБРОВКА: полный оборот CW для проверки timeFor10Deg
-// Перед запуском: установите антенну на отметку 0 градусов
-// После: если антенна не вернулась к отметке — увеличьте/уменьшите timeFor10Deg
+// КАЛИБРОВКА: полный оборот CW
+// Перед запуском: поставьте антенну на отметку 0°
+// Python спросит где она оказалась и пересчитает timeFor10Deg
 // ------------------------------------------
 void runCalibration() {
   Serial.println("CAL_START");
+  positionDeg = 0;
 
   myServo.attach(servoPin);
   myServo.write(SERVO_MOVE_CW);
@@ -64,44 +84,64 @@ void runCalibration() {
   delay(SETTLE_DELAY_MS);
   myServo.detach();
 
+  positionDeg = 360;
   Serial.print("CAL_DONE:");
   Serial.println(totalMs);
 }
 
 // ------------------------------------------
-// ВОЗВРАТ ДОМОЙ: доворот на 10 градусов CW после скана
-// (после 35 шагов антенна стоит на 350°, нужно еще 10°)
+// ВОЗВРАТ ДОМОЙ: доворот от текущей позиции до 360°=0°
+// Учитывает, на каком шаге остановился скан (или после скана)
 // ------------------------------------------
 void returnHome() {
   Serial.println("HOME_START");
+
+  int remainingDeg = 360 - positionDeg;
+  if (remainingDeg <= 0 || remainingDeg >= 360) {
+    positionDeg = 0;
+    Serial.println("HOME_DONE:ALREADY_AT_ZERO");
+    return;
+  }
+
+  int remainingSteps = remainingDeg / DEG_PER_STEP;
+  if (remainingSteps <= 0) {
+    positionDeg = 0;
+    Serial.println("HOME_DONE:ALREADY_AT_ZERO");
+    return;
+  }
+
+  unsigned long rotateMs = (unsigned long)remainingSteps * timeFor10Deg;
+
   myServo.attach(servoPin);
   myServo.write(SERVO_MOVE_CW);
-  delay(timeFor10Deg);
+  delay(rotateMs);
   myServo.write(SERVO_STOP);
   delay(SETTLE_DELAY_MS);
   myServo.detach();
-  Serial.println("HOME_DONE");
+
+  positionDeg = 0;
+  Serial.print("HOME_DONE:ROTATED_");
+  Serial.print(remainingDeg);
+  Serial.println("DEG");
 }
 
 // ------------------------------------------
 // ОСНОВНОЙ СКАН: 36 точек с handshake
 // ------------------------------------------
 void runScan() {
+  positionDeg = 0;
   Serial.println("SCAN_START");
 
   for (int i = 0; i < STEPS_PER_SCAN; i++) {
-    int currentAngle = i * DEG_PER_STEP;
+    positionDeg = i * DEG_PER_STEP;
 
-    // 1. ОСТАНОВКА И УСПОКОЕНИЕ
     myServo.write(SERVO_STOP);
     delay(SETTLE_DELAY_MS);
     myServo.detach();
 
-    // 2. СИГНАЛ ПИТОНУ: готов к замеру на угле currentAngle
     Serial.print("READY:");
-    Serial.println(currentAngle);
+    Serial.println(positionDeg);
 
-    // 3. ЖДЕМ 'K' ОТ ПИТОНА С ТАЙМАУТОМ
     unsigned long startWait = millis();
     while (Serial.available() == 0) {
       if (millis() - startWait > HANDSHAKE_TIMEOUT_MS) {
@@ -115,7 +155,6 @@ void runScan() {
     Serial.read();
     drainSerial();
 
-    // 4. ПОВОРОТ НА СЛЕДУЮЩИЕ 10°
     if (i < STEPS_PER_SCAN - 1) {
       myServo.attach(servoPin);
       myServo.write(SERVO_MOVE_CW);
@@ -123,6 +162,7 @@ void runScan() {
     }
   }
 
+  positionDeg = (STEPS_PER_SCAN - 1) * DEG_PER_STEP;
   Serial.println("SCAN_FINISHED");
   myServo.attach(servoPin);
   myServo.write(SERVO_STOP);
